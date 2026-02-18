@@ -1,0 +1,10 @@
+Operatore | Operatori | impresa | imprese
+ASL | A.S.L. | Azienda ASL | ASL competente per territorio
+Servizio Veterinario di Igiene degli allevamenti e P.Z. | Servizio Veterinario di Igiene degli Allevamenti e delle Produzioni Zootecniche | Igiene degli allevamenti e P.Z.
+SUAP | Sportello Unico per le Attività Produttive | S.U.A.P.
+Comune | Comune di riferimento | Comuni
+ente legittimato | organismo formalmente legittimato | CCIAA | Camera di Commercio
+Regione | Regione Abruzzo
+Servizio di Sanità Veterinaria e Sicurezza Alimentare Regionale | Servizio regionale di Sanità Veterinaria e Sicurezza Alimentare
+Ministero della Salute | Ministero
+organi di controllo | organi di vigilanza | organi di ispezione

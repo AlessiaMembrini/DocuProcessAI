@@ -1,0 +1,14 @@
+Operatore | impresa | ditta | Titolare d'impresa
+legale rappresentante dello stabilimento | legale rappresentante | rappresentante legale
+SUAP | Sportello Unico per le Attività Produttive | S.U.A.P.
+Comune | Comuni | Comune di riferimento
+CCIAA | Camera di Commercio | CCIA
+ASL | A.S.L. | Azienda ASL | Aziende ASL
+Servizi Veterinari ASL | Servizio veterinario
+Servizio Veterinario di Igiene degli allevamenti e P.Z. | Servizio Veterinario di Igiene degli Allevamenti e delle Produzioni Zootecniche | Igiene degli allevamenti e P.Z.
+Servizio veterinario di Igiene degli alimenti e P.Z. | Igiene degli alimenti e P.Z.
+Dipartimento di Prevenzione ASL | Dipartimento di Prevenzione dell’ASL
+organi di controllo | organi di vigilanza | organi di controllo e ispezione
+Regione Abruzzo | Regione
+Servizio di Sanità Veterinaria e Sicurezza Alimentare Regionale | Servizio regionale di Sanità Veterinaria e Sicurezza Alimentare | Servizio Regionale Sanità Veterinaria e Sicurezza Alimentare
+Ministero della Salute | Ministero

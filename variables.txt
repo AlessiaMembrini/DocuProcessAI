@@ -1,0 +1,9 @@
+input_path=.\documenti
+output_path=.\output
+delete_existing_chroma_db=false
+reset_doc_collections=false
+freeze_global_patterns=true
+use_crossdoc_patterns=true
+use_ocr_for_pdf=true
+poppler_path=dependencies\poppler-25.11.0\Library\bin
+comparison_base_path=.\evaluation\comparison_base
