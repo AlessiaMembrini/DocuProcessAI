@@ -300,20 +300,26 @@ def summarize_definition_with_llm(term: str, definition: str, *, max_words: int 
 
 def _dedup_keep_best_definition(defs: List[Dict[str, Any]], *, max_defs: int) -> List[Dict[str, Any]]:
     """
-    Dedup per term (case-insensitive), tenendo la definizione più informativa (più lunga).
+    Dedup per (term, section_id) (case-insensitive), tenendo la definizione più informativa (più lunga).
     """
-    best: Dict[str, Dict[str, Any]] = {}
+    best: Dict[tuple, Dict[str, Any]] = {}
+
     for d in defs or []:
         if not isinstance(d, dict):
             continue
+
         term = str(d.get("term") or "").strip()
         definition = str(d.get("definition") or "").strip()
+        section_id = str(d.get("section_id") or "").strip()  # <- preso da d
+
         if not term or not definition:
             continue
-        k = term.lower()
-        cur = best.get(k)
+
+        key = (term.lower(), section_id.lower())  # <- dedup per sezione
+        cur = best.get(key)
+
         if cur is None or len(definition) > len(str(cur.get("definition") or "")):
-            best[k] = d
+            best[key] = d
 
     out = list(best.values())
 
