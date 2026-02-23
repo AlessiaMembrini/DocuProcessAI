@@ -9,6 +9,7 @@ from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional, Tuple
 
 import chromadb
+from networkx import hits
 
 from utils.llm_utils import call_llm
 from utils.chroma_utils import (
@@ -1209,15 +1210,25 @@ def run_pipeline_on_text(
     if evaluation_mode and disable_crossdoc_read_in_evaluation:
         can_read_crossdoc = False
     if can_read_crossdoc:
-        _ = retrieve_ranked_chunks_with_meta(
-            global_collection,
-            query=" \n".join([c[1] for c in candidates[:15]])[:700],
-            k=8,
-            where={"label": "title_pattern"},
-            include_distances=False,
-        )
-        # pattern-only nel tuo progetto: esempi non usati direttamente
-        cross_title_examples = []
+        title_hits = retrieve_ranked_chunks_with_meta(
+        global_collection,
+        query=" \n".join([c[1] for c in candidates[:15]])[:700],
+        k=8,
+        where={"label": "title_pattern"},
+        include_distances=False,
+    )
+
+    cross_title_examples = [
+        {
+            "label": (h.get("metadata", {}) or {}).get("label", "title_pattern"),
+            "hint": (h.get("metadata", {}) or {}).get("hint", ""),
+            "pattern": (h.get("metadata", {}) or {}).get("pattern", ""),
+            "features": (h.get("metadata", {}) or {}).get("features", {}),
+            "source_id": h.get("id", None),
+            "score": h.get("score", None),
+        }
+        for h in (title_hits or [])
+    ]
 
     p_titles = prompt_classify_titles(items, PromptBlocks(crossdoc_examples=cross_title_examples))
     title_nodes_raw = parse_json_from_text(call_llm_safe(p_titles))
@@ -1349,25 +1360,39 @@ def run_pipeline_on_text(
         can_read_crossdoc2 = bool(global_collection is not None)
         if evaluation_mode and disable_crossdoc_read_in_evaluation:
             can_read_crossdoc2 = False
+
         if can_read_crossdoc2:
-            try:
-                _ = retrieve_ranked_chunks_with_meta(
-                    global_collection,
-                    query=(title + "\n" + section_text_llm[:450])[:700],
-                    k=4,
-                    where={"label": "procedural_section_pattern"},
-                    include_distances=False,
-                )
-                _ = retrieve_ranked_chunks_with_meta(
-                    global_collection,
-                    query=(title + "\n" + section_text_llm[:450])[:700],
-                    k=4,
-                    where={"label": "nonprocedural_section_pattern"},
-                    include_distances=False,
-                )
-                cross_examples_for_cls = []
-            except Exception:
-                cross_examples_for_cls = []
+            proc_hits = retrieve_ranked_chunks_with_meta(
+                global_collection,
+                query=(title + "\n" + section_text_llm[:450])[:700],
+                k=4,
+                where={"label": "procedural_section_pattern"},
+                include_distances=False,
+            )
+            non_hits = retrieve_ranked_chunks_with_meta(
+                global_collection,
+                query=(title + "\n" + section_text_llm[:450])[:700],
+                k=4,
+                where={"label": "nonprocedural_section_pattern"},
+                include_distances=False,
+            )
+
+            def _pack(h: dict) -> dict:
+                m = (h.get("metadata") or {})
+                return {
+                    "label": m.get("label", ""),
+                    "hint": m.get("hint", ""),
+                    "pattern": m.get("pattern", ""),
+                    "features": m.get("features", {}),
+                    "source_id": h.get("id", None),
+                    "score": h.get("score", None),
+                }
+
+            cross_examples_for_cls = [_pack(h) for h in (proc_hits or [])] + [_pack(h) for h in (non_hits or [])]
+            
+            #cross_examples_for_cls = []
+            #except Exception:
+                #cross_examples_for_cls = []
 
         p_isproc = prompt_is_procedural_section(
             section_title=title,
