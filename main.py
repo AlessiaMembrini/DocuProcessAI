@@ -62,33 +62,11 @@ def main() -> None:
             doc_id=base_name,
             persist_dir=persist_dir,
             use_crossdoc_patterns=bool(config.get("use_crossdoc_patterns", True)),
-            # Evita leakage in evaluation: recupera esempi ma NON aggiorna la banca.
             update_global_patterns=not bool(config.get("freeze_global_patterns", False)),
             reset_doc_collection=bool(config.get("reset_doc_collections", False)),
+            output_root=output_folder,
         )
-        '''
-        out_rag = os.path.join(output_folder, f"{base_name}.rag.json")
-        with open(out_rag, "w", encoding="utf-8") as f:
-            json.dump(rag, f, ensure_ascii=False, indent=2)
-
-        out_diag = os.path.join(output_folder, f"{base_name}.procedures.json")
-        with open(out_diag, "w", encoding="utf-8") as f:
-            json.dump(rag.get("diagram_procedures", []), f, ensure_ascii=False, indent=2)
-        
-        from diagrams.run_diagrams import generate_three_diagram_sets
-        res = generate_three_diagram_sets(
-            diagram_procedures_json_path=out_diag,
-            out_root="./output",
-            doc_stem=base_name,   # oppure doc_id
-        )
-        print("[OK] Salvato:", out_rag)
-        print("[OK] Salvato:", out_diag)
-        print("Stats:", rag.get("stats", {}))
-        
-        print(f"[DIAGRAMS] strategy: {len(res['strategy_driven'])} procedure")
-        print(f"[DIAGRAMS] lanes:    {len(res['agent_lanes'])} procedure")
-        print(f"[DIAGRAMS] bpmn:     {len(res['processpiper_bpmn'])} procedure")
-        '''
+       
 
 if __name__ == "__main__":
     main()
