@@ -9,7 +9,6 @@ from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional, Tuple
 
 import chromadb
-from networkx import hits
 
 from utils.llm_utils import call_llm
 from utils.chroma_utils import (
@@ -32,17 +31,15 @@ from utils.definitions_rag import (
     is_outside_section,
 )
 
-# legacy-style agent grounding (alias map)
 from utils.agent_utils import ground_agent
 
-# parent/child + query decomposition + section indexing
 from utils.hierarchical_rag import (
     _section_id_for_line,
     make_section_id,
     assign_section_id_to_span,
     add_sections_to_doc_collection,
     retrieve_child_chunks_in_top_sections,
-    retrieve_definition_support_for_agents,  # includes index_only + retrieve modes
+    retrieve_definition_support_for_agents,
 )
 
 try:
@@ -52,14 +49,14 @@ except Exception:
 
 
 # ----------------------------
-# LLM safety budgets (chars ~= tokens)
+# LLM safety constants
 # ----------------------------
-LLM_MAX_INPUT_CHARS = 360_000        # hard guardrail per call (sotto 128k token con margine)
-LLM_MAX_SECTION_CHARS = 35_000       # sezione passata a LLM (anti-OCR gigante)
-LLM_MAX_JSONBLOCKS_CHARS = 120_000   # json.dumps(context_blocks) massimo
-LLM_MAX_ITEMS_FOR_TITLES = 220       # limita items per prompt_classify_titles
-LLM_MAX_DEF_CANDIDATES = 180         # limita candidates per definizioni
-LLM_MAX_CAND_TEXT_CHARS = 380        # ogni candidate text massimo
+LLM_MAX_INPUT_CHARS = 360_000
+LLM_MAX_SECTION_CHARS = 35_000
+LLM_MAX_JSONBLOCKS_CHARS = 120_000
+LLM_MAX_ITEMS_FOR_TITLES = 220
+LLM_MAX_DEF_CANDIDATES = 180
+LLM_MAX_CAND_TEXT_CHARS = 380
 
 
 # ----------------------------
@@ -77,9 +74,6 @@ def _trim_text_chars(text: str, max_chars: int, *, suffix: str = "\n...[TRUNCATE
 
 
 def _trim_section_for_llm(section_text: str, max_chars: int = LLM_MAX_SECTION_CHARS) -> str:
-    """
-    Mantiene inizio + fine (utile con OCR, dove info importanti possono stare alla fine).
-    """
     s = (section_text or "").strip()
     if len(s) <= max_chars:
         return s
@@ -116,16 +110,10 @@ def _cap_llm_prompt(prompt: str) -> str:
 
 
 def call_llm_safe(prompt: str) -> str:
-    """
-    Hard cap sul prompt per evitare errori di context_length_exceeded.
-    """
     return call_llm(_cap_llm_prompt(prompt))
 
 
 def _adaptive_k(doc_lines: int, base: int, *, k_min: int, k_max: int) -> int:
-    """
-    k dinamico: documenti molto lunghi => k più basso.
-    """
     try:
         n = int(doc_lines)
     except Exception:
@@ -190,9 +178,6 @@ def split_into_lines(text: str) -> List[str]:
 
 
 def parse_json_from_text(s: str) -> Dict[str, Any]:
-    """
-    Parser robusto: se l'LLM ritorna testo con JSON "sporco", prova a estrarre il primo oggetto {...}.
-    """
     if not s:
         return {}
     s = s.strip()
@@ -226,9 +211,6 @@ def _safe_write_json(path: str, obj: Any) -> None:
 
 
 def _extract_json_object(text: str) -> dict:
-    """
-    Estrae il primo oggetto JSON {...} da una stringa.
-    """
     if not text:
         return {}
     s = text.strip()
@@ -259,10 +241,6 @@ def _extract_json_object(text: str) -> dict:
 # Definition summarization (legacy normalization)
 # ----------------------------
 def summarize_definition_with_llm(term: str, definition: str, *, max_words: int = 8) -> str:
-    """
-    Label brevissima (6-8 parole) tipo ruolo/entità, senza verbi coniugati.
-    Output: stringa.
-    """
     term = (term or "").strip()
     definition = (definition or "").strip()
     if not term or not definition:
@@ -276,8 +254,7 @@ def summarize_definition_with_llm(term: str, definition: str, *, max_words: int 
         "- Stile: nome di ruolo/attore o concetto.\n"
         "- Niente virgolette, niente elenco, niente punto finale.\n"
         "- Non ripetere inutilmente il termine se la label è già informativa.\n\n"
-        "Output SOLO JSON:\n"
-        '{ "summary": "..." }\n\n'
+        'Output SOLO JSON:\n{ "summary": "..." }\n\n'
         f"TERMINE: {term}\n"
         f"DEFINIZIONE: {definition}\n"
     )
@@ -300,9 +277,6 @@ def summarize_definition_with_llm(term: str, definition: str, *, max_words: int 
 
 
 def _dedup_keep_best_definition(defs: List[Dict[str, Any]], *, max_defs: int) -> List[Dict[str, Any]]:
-    """
-    Dedup per (term, section_id) (case-insensitive), tenendo la definizione più informativa (più lunga).
-    """
     best: Dict[tuple, Dict[str, Any]] = {}
 
     for d in defs or []:
@@ -311,12 +285,12 @@ def _dedup_keep_best_definition(defs: List[Dict[str, Any]], *, max_defs: int) ->
 
         term = str(d.get("term") or "").strip()
         definition = str(d.get("definition") or "").strip()
-        section_id = str(d.get("section_id") or "").strip()  # <- preso da d
+        section_id = str(d.get("section_id") or "").strip()
 
         if not term or not definition:
             continue
 
-        key = (term.lower(), section_id.lower())  # <- dedup per sezione
+        key = (term.lower(), section_id.lower())
         cur = best.get(key)
 
         if cur is None or len(definition) > len(str(cur.get("definition") or "")):
@@ -340,10 +314,6 @@ def _dedup_keep_best_definition(defs: List[Dict[str, Any]], *, max_defs: int) ->
 # Chunking (per-doc)
 # ----------------------------
 def build_line_chunks(lines: List[str], doc_id: str, sections=None) -> Tuple[List[str], List[dict], List[str]]:
-    """
-    Indicizza SOLO righe non vuote.
-    Ritorna (docs, metas, ids) allineati 1:1 per safe_add.
-    """
     docs: List[str] = []
     metas: List[dict] = []
     ids: List[str] = []
@@ -360,7 +330,7 @@ def build_line_chunks(lines: List[str], doc_id: str, sections=None) -> Tuple[Lis
             {
                 "doc_id": doc_id,
                 "kind": "line",
-                "chunk_id": i,  # chunk_id==line_no (debug)
+                "chunk_id": i,
                 "line_no": i,
                 "section_id": sec_id,
             }
@@ -377,9 +347,6 @@ def build_passage_chunks(
     *,
     sections: Optional[List[Tuple[int, int, str, str]]] = None,
 ) -> Tuple[List[str], List[dict], List[str]]:
-    """
-    Passage chunking per paragrafo (split su righe vuote).
-    """
     passages: List[Tuple[int, int, str]] = []
     buff: List[str] = []
     start_line = 0
@@ -501,9 +468,6 @@ def _norm_header_key(s: str) -> str:
 
 
 def find_repeated_header_lines(lines: List[str], *, min_count: int = 3) -> set[str]:
-    """
-    Euristica: identifica righe ripetute (header/footer OCR) e le ignora in title-candidates.
-    """
     counts: Dict[str, int] = {}
     for ln in lines or []:
         k = _norm_header_key(ln)
@@ -636,9 +600,6 @@ def _normalize_yes_no(label_raw: str) -> str:
 
 
 def link_steps_with_branches(all_steps: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Post-process: se trovi gateway_* seguiti da righe meta 'branch=...', crea branches.
-    """
     if not isinstance(all_steps, list):
         return []
     steps = [s for s in all_steps if isinstance(s, dict) and s.get("id")]
@@ -735,7 +696,7 @@ def build_title_candidates(
 
 
 # ----------------------------
-# DEFINITIONS (Hybrid): regex/heuristics on lines + (optional) retrieval + LLM
+# DEFINITIONS (Hybrid)
 # ----------------------------
 _DEF_COLON_RE = re.compile(r"^\s*([A-Z][A-Z0-9/._-]{1,30})\s*[:=]\s*(.+)\s*$")
 _DEF_DASH_RE = re.compile(r"^\s*([A-Z][A-Z0-9/._-]{1,30})\s*[–\-]\s*(.+)\s*$")
@@ -773,11 +734,6 @@ def _build_definition_candidates_from_lines(
     max_candidates: int = 260,
     max_join_lines: int = 2,
 ) -> List[Dict[str, Any]]:
-    """
-    Passata deterministica:
-    - seleziona righe che sembrano definizioni
-    - concatena 0..max_join_lines righe successive se sembrano continuation
-    """
     out: List[Dict[str, Any]] = []
     seen = set()
 
@@ -827,9 +783,6 @@ def _retrieve_definition_line_candidates_semantic(
     k_per_query: int = 50,
     max_out: int = 180,
 ) -> List[Dict[str, Any]]:
-    """
-    Passata semantica (booster): retrieval su kind="line".
-    """
     queries = [
         "definizioni glossario acronimi si intende",
         "per X si intende",
@@ -884,12 +837,6 @@ def extract_definitions_hybrid(
     max_candidates: int = 260,
     use_semantic_booster: bool = True,
 ) -> List[Dict[str, Any]]:
-    """
-    1) euristiche locali su linee
-    2) (opzionale) retrieval semantico booster
-    3) LLM su pochi candidati => {term, definition, line_no}
-    4) dedup + section_id
-    """
     cand_det = _build_definition_candidates_from_lines(lines, max_candidates=max_candidates, max_join_lines=2)
 
     cand_sem: List[Dict[str, Any]] = []
@@ -983,7 +930,7 @@ def extract_definitions_hybrid(
 
 
 # ----------------------------
-# Legacy-style definition normalization (NO RAG dependency)
+# Legacy-style definition normalization
 # ----------------------------
 _ROLE_HINT_RE = re.compile(
     r"(?i)\b(ufficio|responsabile|dirigente|sportello|operatore|richiedente|utente|cittadino|ente|comune|regione|amministrazione|titolare|impresa|azienda)\b"
@@ -994,9 +941,6 @@ def _build_section_lookup(
     doc_id: str,
     sections: List[Tuple[int, int, str, str]],
 ) -> Dict[str, Dict[str, str]]:
-    """
-    section_id -> {"title":..., "path":...}
-    """
     out: Dict[str, Dict[str, str]] = {}
     for (a, b, title, path) in sections or []:
         sid = make_section_id(doc_id, a, b, title)
@@ -1011,13 +955,6 @@ def normalize_definitions_legacy(
     sections: List[Tuple[int, int, str, str]],
     max_terms: int = 60,
 ) -> List[Dict[str, Any]]:
-    """
-    Normalizzazione definizioni in stile "vecchio":
-    - Non dipende dal retrieval.
-    - Sintesi breve via summarize_definition_with_llm.
-    - is_agent euristico.
-    - Arricchimento con section_title/section_path.
-    """
     if not definitions_raw:
         return []
 
@@ -1076,9 +1013,6 @@ def normalize_definitions_legacy(
 
 
 def build_agent_alias_map_from_normalized_definitions(defs_norm: List[Dict[str, Any]]) -> Dict[str, str]:
-    """
-    alias(lower)->canonical_agent
-    """
     out: Dict[str, str] = {}
     if not defs_norm:
         return out
@@ -1110,6 +1044,87 @@ def build_agent_alias_map_from_normalized_definitions(defs_norm: List[Dict[str, 
     return out
 
 
+def _normalize_ws(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip())
+
+
+def _shape_token(tok: str) -> str:
+    if not tok:
+        return ""
+    if tok.isdigit():
+        return "<NUM>"
+    if re.fullmatch(r"[A-ZÀ-Ü]+", tok):
+        return "<ALLCAPS>"
+    if re.fullmatch(r"[A-ZÀ-Ü][a-zà-ü]+", tok):
+        return "<CAP>"
+    if re.search(r"\d", tok):
+        return "<ALNUM>"
+    return "<LOW>"
+
+
+def _abstract_title_pattern(raw_line: str) -> str:
+    s = _normalize_ws(raw_line)
+    toks = s.split()[:10]
+    shape = " ".join(_shape_token(t) for t in toks)
+    feats = []
+    if TITLE_NUM_RE.match(s):
+        feats.append("NUM_PREFIX")
+    if s.endswith(":"):
+        feats.append("ENDS_COLON")
+    if ALLEGATO_BARE_RE.match(s):
+        feats.append("BARE_ALLEGATO")
+    if _upper_ratio(s) >= 0.65:
+        feats.append("HIGH_UPPER")
+    return f"title_pattern :: {' | '.join(feats) if feats else 'GENERIC'} :: {shape}"
+
+
+def _abstract_section_pattern(title: str, section_text: str, is_proc: bool) -> str:
+    txt = _normalize_ws(section_text)[:1200].lower()
+
+    feats = []
+    if re.search(r"\b(procedur|modalità|istruzioni|iter|compiti|attivit|verific)\b", title or "", re.IGNORECASE):
+        feats.append("TITLE_PROC_HINT")
+    if re.search(r"\b(deve|devono|necessario|obbligatorio)\b", txt):
+        feats.append("DEONTIC")
+    if re.search(r"\b(prima|poi|successivamente|infine)\b", txt):
+        feats.append("SEQUENCE")
+    if re.search(r"(^|\s)(1[\)\.]|2[\)\.]|3[\)\.])", txt):
+        feats.append("ENUMERATION")
+    if re.search(r"\b(domanda|istanza|richiesta|autorizzazione|documentazione)\b", txt):
+        feats.append("ADMIN_LEXICON")
+
+    label = "procedural_section_pattern" if is_proc else "nonprocedural_section_pattern"
+    return f"{label} :: {' | '.join(feats) if feats else 'GENERIC'}"
+
+
+def _append_global_pattern(
+    write_ids: list,
+    write_docs: list,
+    write_metas: list,
+    *,
+    label: str,
+    pattern_doc: str,
+    hint: str,
+    features: dict,
+    source_doc: str,
+) -> None:
+    pattern_doc = _normalize_ws(pattern_doc)
+    if not pattern_doc:
+        return
+
+    _id = hashlib.sha1(f"{label}::{pattern_doc}".encode("utf-8")).hexdigest()[:24]
+
+    write_ids.append(f"{label}_{_id}")
+    write_docs.append(pattern_doc)
+    write_metas.append({
+        "label": label,
+        "hint": hint,
+        "pattern": pattern_doc,
+        "features": json.dumps(features or {}, ensure_ascii=False),
+        "source_doc": source_doc,
+    })
+
+
 # ----------------------------
 # MAIN PIPELINE
 # ----------------------------
@@ -1132,18 +1147,6 @@ def run_pipeline_on_text(
     definitions_use_semantic_booster: bool = True,
     max_normalized_definition_terms: int = 60,
 ) -> Dict[str, Any]:
-    """
-    Flusso:
-      1) Titoli/Outline -> sections
-      2) Indicizzazione Chroma (line/passages + sections parent)
-      3) Definizioni RAW: regex/euristiche + (opz) semantic booster + LLM
-      4) Indicizzazione definizioni RAW (kind=definition con section_id)
-      5) Definizioni NORMALIZZATE (legacy): sintesi da RAW + mapping section/path
-      6) Agent alias map (legacy)
-      7) Prefiltro procedurale + Classificazione LLM sezione
-      8) Retrieval contesto + Estrazione procedure + Diagrammi
-    """
-    # Safety: in evaluation non aggiornare pattern-bank e resetta per-doc collection
     if evaluation_mode:
         update_global_patterns = False
         reset_doc_collection = True
@@ -1153,9 +1156,6 @@ def run_pipeline_on_text(
 
     client = chromadb.PersistentClient(path=persist_dir)
 
-    # IMPORTANT:
-    # - In chroma_utils.get_or_create_collection() il nome viene sanitizzato internamente.
-    # - Qui sanitizziamo SOLO per operazioni dirette (delete + logging/stats), così i nomi combaciano.
     raw_doc_collection_name = f"admin_proc_{doc_id}"
     doc_collection_name = chroma_safe_collection_name(raw_doc_collection_name, prefix="doc")
 
@@ -1164,12 +1164,10 @@ def run_pipeline_on_text(
 
     if reset_doc_collection:
         try:
-            # delete con nome già safe (coerente con get_or_create_collection)
             client.delete_collection(name=doc_collection_name)
         except Exception:
             pass
 
-    # get_or_create_collection sanitizza comunque: passare raw o safe produce lo stesso risultato.
     doc_collection = get_or_create_collection(client, raw_doc_collection_name, embedding_model=embedding_model)
     doc_collection_count_before = int(doc_collection.count()) if doc_collection else 0
 
@@ -1177,9 +1175,14 @@ def run_pipeline_on_text(
     if use_crossdoc_patterns:
         global_collection = get_or_create_collection(client, raw_global_name, embedding_model=embedding_model)
 
-    # ---------------------------------------------------------
+    global_collection_count_before = int(global_collection.count()) if global_collection else 0
+
+    write_crossdoc = bool(global_collection is not None and update_global_patterns and not evaluation_mode)
+    global_write_ids: List[str] = []
+    global_write_docs: List[str] = []
+    global_write_metas: List[dict] = []
+
     # 1) TITLES / OUTLINE
-    # ---------------------------------------------------------
     candidates = build_title_candidates(lines, min_score=0.22, max_candidates=900, header_repeat_threshold=3)
 
     items_all = [
@@ -1206,17 +1209,20 @@ def run_pipeline_on_text(
     items = items_all[:LLM_MAX_ITEMS_FOR_TITLES]
 
     cross_title_examples: List[dict] = []
+    title_hits = []
+
     can_read_crossdoc = bool(global_collection is not None and candidates)
     if evaluation_mode and disable_crossdoc_read_in_evaluation:
         can_read_crossdoc = False
+
     if can_read_crossdoc:
         title_hits = retrieve_ranked_chunks_with_meta(
-        global_collection,
-        query=" \n".join([c[1] for c in candidates[:15]])[:700],
-        k=8,
-        where={"label": "title_pattern"},
-        include_distances=False,
-    )
+            global_collection,
+            query=" \n".join([c[1] for c in candidates[:15]])[:700],
+            k=8,
+            where={"label": "title_pattern"},
+            include_distances=False,
+        )
 
     cross_title_examples = [
         {
@@ -1250,6 +1256,39 @@ def run_pipeline_on_text(
     title_nodes.sort(key=lambda n: n.start_line)
     title_nodes = build_outline_hierarchy(title_nodes)
 
+    if write_crossdoc:
+        for t in title_nodes_raw.get("titles", []) or []:
+            if t.get("is_title") is not True:
+                continue
+            try:
+                ln = int(t.get("line_no"))
+            except Exception:
+                continue
+            if ln < 0 or ln >= len(lines):
+                continue
+
+            raw_line = _normalize_ws(lines[ln])
+            if not raw_line:
+                continue
+
+            pattern_doc = _abstract_title_pattern(raw_line)
+
+            _append_global_pattern(
+                global_write_ids,
+                global_write_docs,
+                global_write_metas,
+                label="title_pattern",
+                pattern_doc=pattern_doc,
+                hint="Structural heading example",
+                features={
+                    "upper_ratio": round(_upper_ratio(raw_line), 3),
+                    "has_number_prefix": bool(TITLE_NUM_RE.match(raw_line)),
+                    "ends_with_colon": raw_line.endswith(":"),
+                    "word_count": len(raw_line.split()),
+                },
+                source_doc=doc_id,
+            )
+
     sections: List[Tuple[int, int, str, str]] = []
     for i, n in enumerate(title_nodes):
         start = n.start_line
@@ -1259,9 +1298,7 @@ def run_pipeline_on_text(
     if not sections:
         sections = [(0, len(lines) - 1, "DOCUMENTO", "DOCUMENTO")]
 
-    # ---------------------------------------------------------
-    # 2) Indicizzazione: line + passage + section (parent)
-    # ---------------------------------------------------------
+    # 2) Indicizzazione doc
     line_docs, line_metas, line_ids = build_line_chunks(lines, doc_id, sections=sections)
     pass_docs, pass_metas, pass_ids = build_passage_chunks(lines, doc_id, sections=sections)
 
@@ -1279,9 +1316,7 @@ def run_pipeline_on_text(
         max_chars=1200,
     )
 
-    # ---------------------------------------------------------
-    # 3) DEFINIZIONI RAW: HYBRID
-    # ---------------------------------------------------------
+    # 3) DEFINIZIONI RAW
     doc_definitions_raw = extract_definitions_hybrid(
         lines=lines,
         doc_collection=doc_collection,
@@ -1292,9 +1327,7 @@ def run_pipeline_on_text(
         use_semantic_booster=bool(definitions_use_semantic_booster),
     )
 
-    # ---------------------------------------------------------
-    # 4) Indicizza definizioni RAW come kind="definition"
-    # ---------------------------------------------------------
+    # 4) Indicizza definizioni RAW
     defs_added = 0
     try:
         defs_added = retrieve_definition_support_for_agents(
@@ -1307,9 +1340,7 @@ def run_pipeline_on_text(
     except Exception:
         defs_added = 0
 
-    # ---------------------------------------------------------
-    # 5) DEFINIZIONI NORMALIZZATE (LEGACY)
-    # ---------------------------------------------------------
+    # 5) DEFINIZIONI NORMALIZZATE
     doc_definitions_norm = normalize_definitions_legacy(
         doc_id=doc_id,
         definitions_raw=doc_definitions_raw,
@@ -1317,15 +1348,11 @@ def run_pipeline_on_text(
         max_terms=int(max_normalized_definition_terms),
     )
 
-    # ---------------------------------------------------------
     # 6) Allowed agents + alias map
-    # ---------------------------------------------------------
     allowed_agents = build_allowed_agents_from_definitions(doc_definitions_raw)
     agent_alias_map = build_agent_alias_map_from_normalized_definitions(doc_definitions_norm)
 
-    # ---------------------------------------------------------
-    # 7) Iterate sections (prefiltro + classify + extract)
-    # ---------------------------------------------------------
+    # 7) Iterate sections
     procedures: List[ProcedureRecord] = []
     diagram_procedures: List[Dict[str, Any]] = []
     procedural_flags_by_section: Dict[Tuple[int, int, str], bool] = {}
@@ -1389,10 +1416,6 @@ def run_pipeline_on_text(
                 }
 
             cross_examples_for_cls = [_pack(h) for h in (proc_hits or [])] + [_pack(h) for h in (non_hits or [])]
-            
-            #cross_examples_for_cls = []
-            #except Exception:
-                #cross_examples_for_cls = []
 
         p_isproc = prompt_is_procedural_section(
             section_title=title,
@@ -1406,12 +1429,31 @@ def run_pipeline_on_text(
         cls = parse_json_from_text(call_llm_safe(p_isproc))
         is_proc = bool(cls.get("is_procedure", False))
         procedural_flags_by_section[(a, b, title)] = is_proc
+
+        if write_crossdoc:
+            label = "procedural_section_pattern" if is_proc else "nonprocedural_section_pattern"
+            pattern_doc = _abstract_section_pattern(title, section_text_llm, is_proc)
+
+            _append_global_pattern(
+                global_write_ids,
+                global_write_docs,
+                global_write_metas,
+                label=label,
+                pattern_doc=pattern_doc,
+                hint="Pattern-only cross-document classifier example",
+                features={
+                    "title": _normalize_ws(title)[:180],
+                    "has_proc_title_hint": bool(
+                        re.search(r"\b(procedur|modalità|istruzioni|iter|compiti|attivit|verific)\b", title or "", re.IGNORECASE)
+                    ),
+                    "text_len": len(section_text_llm or ""),
+                },
+                source_doc=doc_id,
+            )
+
         if not is_proc:
             continue
 
-        # ---------------------------------------------------------
-        # SUPPORT CONTEXT: parent/child + definizioni
-        # ---------------------------------------------------------
         support_query = build_support_query(title)
 
         if enable_parent_child_retrieval:
@@ -1437,7 +1479,6 @@ def run_pipeline_on_text(
 
         pass_hits = [h for h in (pass_hits or []) if is_outside_section(h, a, b)]
 
-        # definizioni agent-aware
         agent_support_blocks: List[dict] = []
         try:
             kps_def_support = _adaptive_k(len(lines), 4, k_min=2, k_max=4)
@@ -1531,12 +1572,10 @@ def run_pipeline_on_text(
         context_blocks_llm = _shrink_context_blocks_for_llm(context_blocks, max_blocks=12, max_block_text_chars=650)
         ctx_json = _safe_json_dumps(context_blocks_llm, max_chars=LLM_MAX_JSONBLOCKS_CHARS)
 
-        # A) output sintetico
         prompt_min = (
             "Estrai UNA procedura come lista di step (testo breve) in ITALIANO.\n"
             "Vincoli: usa SOLO la sezione + contesto evidenziale per-doc. Non inventare.\n"
-            "Output SOLO JSON:\n"
-            '{ "status": "complete"|"partial", "steps": [str], "notes": [str] }\n\n'
+            'Output SOLO JSON:\n{ "status": "complete"|"partial", "steps": [str], "notes": [str] }\n\n'
             f"TITOLO: {title}\nPATH: {path}\n\n"
             "SEZIONE:\n"
             f"{section_text_llm}\n\n"
@@ -1558,7 +1597,6 @@ def run_pipeline_on_text(
             )
         )
 
-        # B) diagram-ready
         procedure_id = f"{doc_id}_proc_{sec_idx:03d}"
         subsection_title = title
 
@@ -1581,7 +1619,6 @@ def run_pipeline_on_text(
         raw_steps = _coerce_steps_schema(extr_steps.get("steps"))
         linked_steps = link_steps_with_branches(raw_steps)
 
-        # Grounding agente usando alias_map legacy
         for s in linked_steps:
             s["agent"] = ground_agent(s.get("agent", "Operatore"), agent_alias_map)
 
@@ -1616,9 +1653,7 @@ def run_pipeline_on_text(
             }
         )
 
-    # ---------------------------------------------------------
     # OUTPUT saving
-    # ---------------------------------------------------------
     doc_dir = os.path.join(output_root, doc_id)
     os.makedirs(doc_dir, exist_ok=True)
 
@@ -1661,6 +1696,7 @@ def run_pipeline_on_text(
             "doc_collection": doc_collection_name,
             "global_collection_raw": raw_global_name,
             "global_collection": global_collection_name,
+            "global_collection_count_before": int(global_collection_count_before),
             "evaluation_mode": bool(evaluation_mode),
             "use_crossdoc_patterns": bool(use_crossdoc_patterns),
             "update_global_patterns": bool(update_global_patterns),
@@ -1674,6 +1710,25 @@ def run_pipeline_on_text(
         },
         "outputs": out_paths,
     }
+
+    if write_crossdoc and global_write_ids:
+        seen = set()
+        ids2, docs2, metas2 = [], [], []
+        for _id, d, m in zip(global_write_ids, global_write_docs, global_write_metas):
+            if _id in seen:
+                continue
+            seen.add(_id)
+            ids2.append(_id)
+            docs2.append(d)
+            metas2.append(m)
+
+        added_global = safe_add(global_collection, ids=ids2, documents=docs2, metadatas=metas2)
+        result["stats"]["global_patterns_added_now"] = int(added_global)
+    else:
+        result["stats"]["global_patterns_added_now"] = 0
+
+    result["stats"]["global_collection_count_after"] = int(global_collection.count()) if global_collection else 0
+
     _safe_write_json(out_paths["result_json"], result)
 
     if generate_diagrams and generate_three_diagram_sets is not None and diagram_procedures:

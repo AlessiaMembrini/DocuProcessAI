@@ -27,8 +27,7 @@ def main() -> None:
     output_folder = config["output_path"]
     os.makedirs(output_folder, exist_ok=True)
 
-    comparison_base = config.get("comparison_base") or os.path.join(".", "eval", "comparison_base")
-
+    comparison_base = config.get("comparison_base_path") or os.path.join(".", "eval", "comparison_base")
     files = [
         os.path.join(input_folder, f)
         for f in os.listdir(input_folder)
