@@ -57,6 +57,7 @@ LLM_MAX_JSONBLOCKS_CHARS = 120_000
 LLM_MAX_ITEMS_FOR_TITLES = 220
 LLM_MAX_DEF_CANDIDATES = 180
 LLM_MAX_CAND_TEXT_CHARS = 380
+LLM_MAX_SIMILAR_PROCEDURES_CHARS = 18_000
 
 
 # ----------------------------
@@ -235,6 +236,43 @@ def _extract_json_object(text: str) -> dict:
                 except Exception:
                     return {}
     return {}
+
+
+# ----------------------------
+# Cross-document similar procedures helpers
+# ----------------------------
+def _build_procedure_summary_text(
+    *,
+    doc_id: str,
+    section_title: str,
+    section_path: str,
+    steps: List[str],
+    notes: List[str],
+) -> str:
+    steps_txt = "\n".join(f"- {s}" for s in (steps or [])[:20] if isinstance(s, str) and s.strip())
+    notes_txt = "\n".join(f"- {n}" for n in (notes or [])[:10] if isinstance(n, str) and n.strip())
+
+    return (
+        f"DOC_ID: {doc_id}\n"
+        f"SECTION_TITLE: {section_title}\n"
+        f"SECTION_PATH: {section_path}\n"
+        f"STEPS:\n{steps_txt if steps_txt else '-'}\n"
+        f"NOTES:\n{notes_txt if notes_txt else '-'}"
+    )
+
+
+def _pack_similar_procedure_hit(h: dict) -> dict:
+    meta = (h.get("metadata") or {})
+    return {
+        "procedure_id": meta.get("procedure_id", ""),
+        "source_doc_id": meta.get("source_doc_id", ""),
+        "section_title": meta.get("section_title", ""),
+        "section_path": meta.get("section_path", ""),
+        "status": meta.get("status", ""),
+        "n_steps": meta.get("n_steps", None),
+        "text": _trim_text_chars(str(h.get("text", "") or ""), 1200),
+        "score": h.get("score", None),
+    }
 
 
 # ----------------------------
@@ -1137,6 +1175,7 @@ def run_pipeline_on_text(
     update_global_patterns: bool = True,
     reset_doc_collection: bool = False,
     global_patterns_collection: str = "admin_proc_global_patterns_v2_pattern_only",
+    global_procedures_collection: str = "admin_proc_global_procedures_v1",
     output_root: str = "./output",
     generate_diagrams: bool = True,
     evaluation_mode: bool = False,
@@ -1162,6 +1201,9 @@ def run_pipeline_on_text(
     raw_global_name = global_patterns_collection
     global_collection_name = chroma_safe_collection_name(raw_global_name, prefix="doc")
 
+    raw_global_proc_name = global_procedures_collection
+    global_proc_collection_name = chroma_safe_collection_name(raw_global_proc_name, prefix="doc")
+
     if reset_doc_collection:
         try:
             client.delete_collection(name=doc_collection_name)
@@ -1175,12 +1217,26 @@ def run_pipeline_on_text(
     if use_crossdoc_patterns:
         global_collection = get_or_create_collection(client, raw_global_name, embedding_model=embedding_model)
 
+    global_proc_collection = None
+    if use_crossdoc_patterns:
+        global_proc_collection = get_or_create_collection(
+            client,
+            raw_global_proc_name,
+            embedding_model=embedding_model,
+        )
+
     global_collection_count_before = int(global_collection.count()) if global_collection else 0
+    global_proc_collection_count_before = int(global_proc_collection.count()) if global_proc_collection else 0
 
     write_crossdoc = bool(global_collection is not None and update_global_patterns and not evaluation_mode)
+
     global_write_ids: List[str] = []
     global_write_docs: List[str] = []
     global_write_metas: List[dict] = []
+
+    global_proc_write_ids: List[str] = []
+    global_proc_write_docs: List[str] = []
+    global_proc_write_metas: List[dict] = []
 
     # 1) TITLES / OUTLINE
     candidates = build_title_candidates(lines, min_score=0.22, max_candidates=900, header_repeat_threshold=3)
@@ -1454,6 +1510,36 @@ def run_pipeline_on_text(
         if not is_proc:
             continue
 
+        # ----------------------------
+        # NEW: retrieve similar procedures cross-document
+        # ----------------------------
+        similar_procedures_blocks: List[dict] = []
+
+        can_read_crossdoc_procedures = bool(global_proc_collection is not None)
+        if evaluation_mode and disable_crossdoc_read_in_evaluation:
+            can_read_crossdoc_procedures = False
+
+        if can_read_crossdoc_procedures:
+            similar_query = f"{title}\n{path}\n{section_text_llm[:1200]}"
+
+            try:
+                similar_hits = retrieve_ranked_chunks_with_meta(
+                    global_proc_collection,
+                    query=similar_query[:1800],
+                    k=6,
+                    include_distances=False,
+                )
+            except Exception:
+                similar_hits = []
+
+            for h in (similar_hits or []):
+                meta = (h.get("metadata") or {})
+                if meta.get("source_doc_id") == doc_id:
+                    continue
+                similar_procedures_blocks.append(_pack_similar_procedure_hit(h))
+                if len(similar_procedures_blocks) >= 3:
+                    break
+
         support_query = build_support_query(title)
 
         if enable_parent_child_retrieval:
@@ -1571,16 +1657,26 @@ def run_pipeline_on_text(
 
         context_blocks_llm = _shrink_context_blocks_for_llm(context_blocks, max_blocks=12, max_block_text_chars=650)
         ctx_json = _safe_json_dumps(context_blocks_llm, max_chars=LLM_MAX_JSONBLOCKS_CHARS)
+        similar_proc_json = _safe_json_dumps(
+            similar_procedures_blocks,
+            max_chars=LLM_MAX_SIMILAR_PROCEDURES_CHARS,
+        )
 
         prompt_min = (
             "Estrai UNA procedura come lista di step (testo breve) in ITALIANO.\n"
-            "Vincoli: usa SOLO la sezione + contesto evidenziale per-doc. Non inventare.\n"
+            "Vincoli:\n"
+            "- Usa come fonte primaria SOLO la sezione corrente e il contesto evidenziale per-doc.\n"
+            "- Le procedure simili cross-document sono SOLO supporto strutturale/stilistico.\n"
+            "- Non copiare contenuti non presenti nella sezione corrente.\n"
+            "- Non inventare.\n\n"
             'Output SOLO JSON:\n{ "status": "complete"|"partial", "steps": [str], "notes": [str] }\n\n'
             f"TITOLO: {title}\nPATH: {path}\n\n"
             "SEZIONE:\n"
             f"{section_text_llm}\n\n"
-            "CONTESTO (definizioni/passaggi):\n"
-            f"{ctx_json}"
+            "CONTESTO EVIDENZIALE PER-DOC (definizioni/passaggi):\n"
+            f"{ctx_json}\n\n"
+            "PROCEDURE SIMILI CROSS-DOCUMENT (solo supporto):\n"
+            f"{similar_proc_json}"
         )
         extr_min = parse_json_from_text(call_llm_safe(prompt_min))
 
@@ -1596,6 +1692,30 @@ def run_pipeline_on_text(
                 evidence_chunk_ids=[cb.get("evidence_id") for cb in context_blocks_llm[:12] if cb.get("evidence_id")],
             )
         )
+
+        # ----------------------------
+        # NEW: save extracted procedure in global procedures collection
+        # ----------------------------
+        procedure_summary_text = _build_procedure_summary_text(
+            doc_id=doc_id,
+            section_title=title,
+            section_path=path,
+            steps=list(extr_min.get("steps", []) or []),
+            notes=list(extr_min.get("notes", []) or []),
+        )
+
+        proc_global_id = _stable_id_any("global_proc", doc_id, sec_idx, title, path)
+
+        global_proc_write_ids.append(proc_global_id)
+        global_proc_write_docs.append(procedure_summary_text)
+        global_proc_write_metas.append({
+            "procedure_id": proc_global_id,
+            "source_doc_id": doc_id,
+            "section_title": title,
+            "section_path": path,
+            "status": str(extr_min.get("status", "partial")),
+            "n_steps": len(list(extr_min.get("steps", []) or [])),
+        })
 
         procedure_id = f"{doc_id}_proc_{sec_idx:03d}"
         subsection_title = title
@@ -1650,6 +1770,7 @@ def run_pipeline_on_text(
                     for i, s in enumerate(linked_steps)
                 ],
                 "supporting_evidence": supporting_evidence,
+                "similar_crossdoc_procedures": similar_procedures_blocks,
             }
         )
 
@@ -1697,6 +1818,9 @@ def run_pipeline_on_text(
             "global_collection_raw": raw_global_name,
             "global_collection": global_collection_name,
             "global_collection_count_before": int(global_collection_count_before),
+            "global_procedures_collection_raw": raw_global_proc_name,
+            "global_procedures_collection": global_proc_collection_name,
+            "global_procedures_collection_count_before": int(global_proc_collection_count_before),
             "evaluation_mode": bool(evaluation_mode),
             "use_crossdoc_patterns": bool(use_crossdoc_patterns),
             "update_global_patterns": bool(update_global_patterns),
@@ -1727,7 +1851,31 @@ def run_pipeline_on_text(
     else:
         result["stats"]["global_patterns_added_now"] = 0
 
+    if write_crossdoc and global_proc_collection is not None and global_proc_write_ids:
+        seen = set()
+        ids2, docs2, metas2 = [], [], []
+        for _id, d, m in zip(global_proc_write_ids, global_proc_write_docs, global_proc_write_metas):
+            if _id in seen:
+                continue
+            seen.add(_id)
+            ids2.append(_id)
+            docs2.append(d)
+            metas2.append(m)
+
+        added_global_proc = safe_add(
+            global_proc_collection,
+            ids=ids2,
+            documents=docs2,
+            metadatas=metas2,
+        )
+        result["stats"]["global_procedures_added_now"] = int(added_global_proc)
+    else:
+        result["stats"]["global_procedures_added_now"] = 0
+
     result["stats"]["global_collection_count_after"] = int(global_collection.count()) if global_collection else 0
+    result["stats"]["global_procedures_collection_count_after"] = (
+        int(global_proc_collection.count()) if global_proc_collection else 0
+    )
 
     _safe_write_json(out_paths["result_json"], result)
 
