@@ -17,16 +17,18 @@ def _j(obj: Any, n: int) -> str:
 
 @dataclass
 class PromptBlocks:
-    # cross-doc: SOLO pattern (feature), mai testo contenutistico
+    # cross-doc: pattern-only per classificazione / struttura, mai testo autorevole
     crossdoc_examples: Optional[List[dict]] = None
-    # (attenzione: può introdurre bias nel classificatore)
+    # attenzione: può introdurre bias nel classificatore
     local_similar_sections: Optional[List[str]] = None
-    # contesto evidenziale (per-doc)
+    # contesto evidenziale per-doc
     rag_context_blocks: Optional[List[dict]] = None
     # definizioni per-doc
     definitions: Optional[List[dict]] = None
     allowed_agents: Optional[List[str]] = None
     supporting_actions: Optional[List[dict]] = None  # [{"action_id","label","action_text",...}]
+    # NUOVO: procedure simili da altri documenti, usate solo come supporto strutturale
+    similar_crossdoc_procedures: Optional[List[dict]] = None
 
 
 # ----------------------------
@@ -75,8 +77,8 @@ def prompt_is_procedural_section(
 ) -> str:
     """
     Classificatore con cross-doc pattern-only:
-    - esempi cross-doc contengono SOLO feature (pattern), mai testo.
-    - local_similar_sections (se passato) è dichiarato non autorevole.
+    - esempi cross-doc contengono SOLO feature/pattern, mai testo contenutistico
+    - local_similar_sections è dichiarato non autorevole
     """
     cross_proc = ""
     cross_non = ""
@@ -92,7 +94,8 @@ def prompt_is_procedural_section(
         sims = sims[:2]
         if sims:
             local_sim = (
-                "NOTE (non autorevole): estratti di sezioni simili nello stesso documento (solo per lessico, NON per decidere):\n"
+                "NOTE (non autorevole): estratti di sezioni simili nello stesso documento "
+                "(solo per lessico, NON per decidere):\n"
                 f"{_j(sims, 2)}\n\n"
             )
 
@@ -135,14 +138,17 @@ def prompt_extract_diagram_steps(
 ) -> str:
     """
     Estrazione step rigidissima:
-    - cross-doc: pattern-only (feature), mai contenuto
-    - supporting_actions: consente ref=action:Ax per rimandi interni
+    - rag_context_blocks = contesto autorevole per-doc
+    - crossdoc_examples = solo pattern/feature
+    - similar_crossdoc_procedures = supporto strutturale, NON fonte primaria
+    - supporting_actions = consente ref=action:Ax per rimandi interni
     """
     cross_steps = ""
     defs = ""
     ctx = ""
     allowed_agents = ""
     support_actions = ""
+    similar_procs = ""
 
     if blocks and blocks.crossdoc_examples:
         cross_steps = (
@@ -168,12 +174,24 @@ def prompt_extract_diagram_steps(
     if blocks and blocks.rag_context_blocks:
         ctx = "CONTESTO EVIDENZIALE (per-doc):\n" + _j(blocks.rag_context_blocks, 10) + "\n\n"
 
+    if blocks and blocks.similar_crossdoc_procedures:
+        similar_procs = (
+            "PROCEDURE SIMILI CROSS-DOCUMENT (solo supporto strutturale, NON fonte primaria):\n"
+            f"{_j(blocks.similar_crossdoc_procedures, 3)}\n\n"
+        )
+
     return (
         "Task: estrarre STEP strutturati per BPMN (diagram-ready).\n\n"
+        "Gerarchia delle fonti:\n"
+        "1) TESTO SEZIONE = fonte primaria\n"
+        "2) CONTESTO EVIDENZIALE per-doc = supporto autorevole\n"
+        "3) PROCEDURE SIMILI CROSS-DOCUMENT = solo supporto strutturale/stilistico\n"
+        "4) ESEMPI CROSS-DOCUMENT pattern-only = solo guida formale\n\n"
         "Vincoli forti:\n"
-        "- Fonte: SOLO testo sezione + contesto evidenziale per-doc.\n"
-        "- Cross-document: SOLO pattern/feature (non contengono testo) => NON usarli come contenuto.\n"
-        "- Non inventare step/rami/ruoli. Se manca info, metti una nota.\n\n"
+        "- Non inventare step, rami o ruoli.\n"
+        "- Non copiare contenuti da altre procedure se non sono supportati dal testo corrente.\n"
+        "- Le procedure simili cross-document possono aiutare SOLO a capire forma, granularità e organizzazione del flusso.\n"
+        "- Se manca informazione nel testo corrente, lascia una nota invece di completare inventando.\n\n"
         "Regole agent:\n"
         "- agent deve essere in ITALIANO.\n"
         "- Vietati: 'operator', 'system', 'user', 'citizen', 'applicant'.\n"
@@ -192,7 +210,7 @@ def prompt_extract_diagram_steps(
         "Output: SOLO JSON valido:\n"
         "{ \"status\": \"complete\"|\"partial\", \"notes\": [str],\n"
         "  \"steps\": [ {\"id\":str,\"type\":str,\"agent\":str,\"description_synthetic\":str,\"meta\":str} ] }\n\n"
-        f"{defs}{allowed_agents}{cross_steps}{support_actions}{ctx}"
+        f"{defs}{allowed_agents}{cross_steps}{support_actions}{ctx}{similar_procs}"
         f"procedure_id: {procedure_id}\n"
         f"section_title: {section_title}\n"
         f"subsection_title: {subsection_title}\n"
@@ -201,10 +219,10 @@ def prompt_extract_diagram_steps(
         f"{section_text}\n"
     )
 
+
 def prompt_normalize_definition(term: str, evidence_blocks: List[dict]) -> str:
     """
-    Prompt “RAG di consolidamento”: produce forma canonica + alias.
-    NB: se vuoi separarlo, spostalo in utils/prompts_base.py (consigliato).
+    Prompt di consolidamento: produce forma canonica + alias.
     """
     return (
         "Sei un assistente che normalizza definizioni in documenti amministrativi.\n"
@@ -224,4 +242,3 @@ def prompt_normalize_definition(term: str, evidence_blocks: List[dict]) -> str:
         f"TERMINE: {term}\n"
         f"EVIDENZE:\n{json.dumps(evidence_blocks[:12], ensure_ascii=False)}"
     )
-
